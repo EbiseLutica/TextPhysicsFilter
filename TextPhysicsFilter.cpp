@@ -49,6 +49,11 @@ auto initial_angle = FILTER_ITEM_TRACK(L"初速角度 (-360～360)", 0.0, -360.0
 auto angular_velocity = FILTER_ITEM_TRACK(L"回転速度", 0.0, -2000.0, 2000.0, 1.0);
 auto tumble = FILTER_ITEM_CHECK(L"倒れやすくする", true);
 auto boundary_collision = FILTER_ITEM_CHECK(L"画面端と衝突", true);
+auto region_center_x = FILTER_ITEM_TRACK(L"領域中心X", 0.0, -100000.0, 100000.0, 1.0);
+auto region_center_y = FILTER_ITEM_TRACK(L"領域中心Y", 0.0, -100000.0, 100000.0, 1.0);
+auto region_width_percent = FILTER_ITEM_TRACK(L"領域幅 (%)", 100.0, 1.0, 1000.0, 0.1);
+auto region_height_percent = FILTER_ITEM_TRACK(L"領域高さ (%)", 100.0, 1.0, 1000.0, 0.1);
+auto visualize_region = FILTER_ITEM_CHECK(L"物理演算領域を可視化", false);
 auto substeps = FILTER_ITEM_TRACK(L"計算精度", 4.0, 1.0, 16.0, 1.0);
 auto sleep_speed = FILTER_ITEM_TRACK(L"停止速度", 15.0, 0.0, 500.0, 1.0);
 
@@ -65,6 +70,11 @@ void* items[] = {
     &angular_velocity,
     &tumble,
     &boundary_collision,
+    &region_center_x,
+    &region_center_y,
+    &region_width_percent,
+    &region_height_percent,
+    &visualize_region,
     &substeps,
     &sleep_speed,
     nullptr,
@@ -73,6 +83,27 @@ void* items[] = {
 struct Point {
     double x = 0.0;
     double y = 0.0;
+};
+
+struct PhysicsRegion {
+    double center_x = 0.0;
+    double center_y = 0.0;
+    double width = 1.0;
+    double height = 1.0;
+
+    double left() const { return center_x - width * 0.5; }
+    double right() const { return center_x + width * 0.5; }
+    double top() const { return center_y - height * 0.5; }
+    double bottom() const { return center_y + height * 0.5; }
+};
+
+struct ObjectTransform2D {
+    double x = 0.0;
+    double y = 0.0;
+    double cosine = 1.0;
+    double sine = 0.0;
+    double scale_x = 1.0;
+    double scale_y = 1.0;
 };
 
 struct Piece {
@@ -142,6 +173,94 @@ float angleToBox(double degrees) {
 
 double angleFromBox(float radians) {
     return -static_cast<double>(radians) * 180.0 / kPi;
+}
+
+PhysicsRegion makePhysicsRegion(const SCENE_INFO& scene) {
+    const double width_percent = std::clamp(region_width_percent.value, 1.0, 1000.0);
+    const double height_percent = std::clamp(region_height_percent.value, 1.0, 1000.0);
+    return {
+        region_center_x.value,
+        region_center_y.value,
+        std::max(1.0, scene.width * width_percent / 100.0),
+        std::max(1.0, scene.height * height_percent / 100.0),
+    };
+}
+
+ObjectTransform2D makeObjectTransform(const OBJECT_IMAGE_PARAM& param) {
+    const double radians = param.rz * kPi / 180.0;
+    return {
+        param.x,
+        param.y,
+        std::cos(radians),
+        std::sin(radians),
+        std::abs(param.sx) > 1e-6 ? param.sx : 1.0,
+        std::abs(param.sy) > 1e-6 ? param.sy : 1.0,
+    };
+}
+
+Point worldToLocal(const ObjectTransform2D& transform,
+                   double world_x, double world_y) {
+    const double dx = world_x - transform.x;
+    const double dy = world_y - transform.y;
+    return {
+        (dx * transform.cosine + dy * transform.sine) / transform.scale_x,
+        (-dx * transform.sine + dy * transform.cosine) / transform.scale_y,
+    };
+}
+
+void appendWorldQuad(std::vector<VERTEX_COLOR>& vertices,
+                     const ObjectTransform2D& transform,
+                     double left, double top, double right, double bottom,
+                     float red, float green, float blue, float alpha) {
+    const Point corners[] = {
+        worldToLocal(transform, left, top),
+        worldToLocal(transform, right, top),
+        worldToLocal(transform, right, bottom),
+        worldToLocal(transform, left, bottom),
+    };
+    for (const auto& corner : corners) {
+        vertices.push_back({
+            static_cast<float>(corner.x), static_cast<float>(corner.y), 0.0f,
+            red * alpha, green * alpha, blue * alpha, alpha,
+        });
+    }
+}
+
+void drawPhysicsRegion(FILTER_PROC_VIDEO* video, const PhysicsRegion& region,
+                       const ObjectTransform2D& transform) {
+    if (!video || !video->draw_poly) return;
+    constexpr float red = 0.15f;
+    constexpr float green = 1.0f;
+    constexpr float blue = 0.35f;
+    constexpr double border = 2.0;
+    const double half_border = border * 0.5;
+    const double left = region.left();
+    const double right = region.right();
+    const double top = region.top();
+    const double bottom = region.bottom();
+    std::vector<VERTEX_COLOR> vertices;
+    vertices.reserve(20);
+    appendWorldQuad(vertices, transform, left, top, right, bottom,
+                    red, green, blue, 0.08f);
+    appendWorldQuad(vertices, transform,
+                    left - half_border, top - half_border,
+                    right + half_border, top + half_border,
+                    red, green, blue, 0.85f);
+    appendWorldQuad(vertices, transform,
+                    left - half_border, bottom - half_border,
+                    right + half_border, bottom + half_border,
+                    red, green, blue, 0.85f);
+    appendWorldQuad(vertices, transform,
+                    left - half_border, top + half_border,
+                    left + half_border, bottom - half_border,
+                    red, green, blue, 0.85f);
+    appendWorldQuad(vertices, transform,
+                    right - half_border, top + half_border,
+                    right + half_border, bottom - half_border,
+                    red, green, blue, 0.85f);
+    if (video->set_culling_state) video->set_culling_state(false);
+    video->draw_poly(VERTEX_TYPE::QUAD_COLOR, vertices.data(),
+                     static_cast<int>(vertices.size()), nullptr);
 }
 
 double tumbleAngle(int index) {
@@ -359,7 +478,8 @@ b2BodyId createBox(b2WorldId world, double x, double y,
 }
 
 bool resetSimulation(Runtime& runtime, FILTER_PROC_VIDEO* video,
-                     const OBJECT_IMAGE_PARAM& start, std::uint64_t key) {
+                     const OBJECT_IMAGE_PARAM& start,
+                     const PhysicsRegion& region, std::uint64_t key) {
     runtime.destroyWorld();
     b2WorldDef world_definition = b2DefaultWorldDef();
     world_definition.gravity = {0.0f, -meters(gravity.value)};
@@ -369,19 +489,19 @@ bool resetSimulation(Runtime& runtime, FILTER_PROC_VIDEO* video,
     const double bounce = std::clamp(restitution.value, 0.0, 1.0);
     if (boundary_collision.value) {
         constexpr double thickness = kPixelsPerMeter;
-        const double half_width = video->scene->width * 0.5;
-        const double half_height = video->scene->height * 0.5;
-        createBox(runtime.world, 0.0, half_height + thickness * 0.5,
-                  video->scene->width + thickness * 2.0, thickness,
+        createBox(runtime.world, region.center_x,
+                  region.bottom() + thickness * 0.5,
+                  region.width + thickness * 2.0, thickness,
                   false, friction.value, bounce, 1.0);
-        createBox(runtime.world, 0.0, -half_height - thickness * 0.5,
-                  video->scene->width + thickness * 2.0, thickness,
+        createBox(runtime.world, region.center_x,
+                  region.top() - thickness * 0.5,
+                  region.width + thickness * 2.0, thickness,
                   false, friction.value, bounce, 1.0);
-        createBox(runtime.world, -half_width - thickness * 0.5, 0.0,
-                  thickness, video->scene->height,
+        createBox(runtime.world, region.left() - thickness * 0.5,
+                  region.center_y, thickness, region.height,
                   false, friction.value, bounce, 1.0);
-        createBox(runtime.world, half_width + thickness * 0.5, 0.0,
-                  thickness, video->scene->height,
+        createBox(runtime.world, region.right() + thickness * 0.5,
+                  region.center_y, thickness, region.height,
                   false, friction.value, bounce, 1.0);
     }
 
@@ -475,7 +595,17 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
         runtime->font = font;
         runtime->destroyWorld();
     }
+    const PhysicsRegion region = makePhysicsRegion(*video->scene);
     if (runtime->pieces.empty()) {
+        if (visualize_region.value) {
+            OBJECT_IMAGE_PARAM current{};
+            current.sx = current.sy = current.sz = 1.0f;
+            current.alpha = 1.0f;
+            if (video->get_output_image_param) {
+                video->get_output_image_param(nullptr, 0.0, &current, sizeof(current));
+            }
+            drawPhysicsRegion(video, region, makeObjectTransform(current));
+        }
         if (video->set_default_anchor) video->set_default_anchor(0, 0);
         return false;
     }
@@ -487,20 +617,25 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
         video->get_output_image_param(nullptr, -video->object->time, &start, sizeof(start));
     }
     std::uint64_t key = 1469598103934665603ull;
-    hashValue(key, width); hashValue(key, height); hashValue(key, threshold); hashValue(key, mode);
+    hashValue(key, width); hashValue(key, height);
+    hashValue(key, video->scene->width); hashValue(key, video->scene->height);
+    hashValue(key, threshold); hashValue(key, mode);
     hashValue(key, gravity.value); hashValue(key, gravity_scale.value);
     hashValue(key, friction.value); hashValue(key, restitution.value); hashValue(key, density.value);
     hashValue(key, initial_speed.value); hashValue(key, initial_angle.value);
     hashValue(key, angular_velocity.value); hashValue(key, tumble.value);
-    hashValue(key, boundary_collision.value); hashValue(key, substeps.value);
-    hashValue(key, sleep_speed.value); hashValue(key, start);
+    hashValue(key, boundary_collision.value);
+    hashValue(key, region_center_x.value); hashValue(key, region_center_y.value);
+    hashValue(key, region_width_percent.value); hashValue(key, region_height_percent.value);
+    hashValue(key, substeps.value); hashValue(key, sleep_speed.value);
+    hashValue(key, start);
     hashValue(key, runtime->pieces.size());
     for (const wchar_t character : text) hashValue(key, character);
 
     const int frame = std::max(0, video->object->frame);
     if (!runtime->simulation_valid || runtime->simulation_key != key ||
         frame < runtime->cached_frame) {
-        if (!resetSimulation(*runtime, video, start, key)) return true;
+        if (!resetSimulation(*runtime, video, start, region, key)) return true;
     }
     const double frame_seconds = static_cast<double>(video->scene->scale) / video->scene->rate;
     for (int simulated = runtime->cached_frame; simulated < frame; ++simulated) {
@@ -515,11 +650,7 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
     if (video->get_output_image_param) {
         video->get_output_image_param(nullptr, 0.0, &current, sizeof(current));
     }
-    const double radians = current.rz * kPi / 180.0;
-    const double cosine = std::cos(radians);
-    const double sine = std::sin(radians);
-    const double scale_x = std::abs(current.sx) > 1e-6 ? current.sx : 1.0;
-    const double scale_y = std::abs(current.sy) > 1e-6 ? current.sy : 1.0;
+    const ObjectTransform2D transform = makeObjectTransform(current);
     for (std::size_t index = 0; index < runtime->pieces.size(); ++index) {
         const auto& piece = runtime->pieces[index];
         if (B2_IS_NULL(piece.body) || !b2Body_IsValid(piece.body)) continue;
@@ -527,20 +658,19 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
         const b2Rot rotation = b2Body_GetRotation(piece.body);
         const double world_x = static_cast<double>(position.x) * kPixelsPerMeter;
         const double world_y = -static_cast<double>(position.y) * kPixelsPerMeter;
-        const double dx = world_x - current.x;
-        const double dy = world_y - current.y;
-        const float local_x = static_cast<float>((dx * cosine + dy * sine) / scale_x);
-        const float local_y = static_cast<float>((-dx * sine + dy * cosine) / scale_y);
+        const Point local = worldToLocal(transform, world_x, world_y);
         const float local_rotation = static_cast<float>(
             angleFromBox(b2Rot_GetAngle(rotation)) - current.rz);
         const std::wstring resource = L"resource:text_decomposition_" +
             std::to_wstring(video->object->effect_id) + L"_" + std::to_wstring(index);
         video->create_image_resource(resource.c_str(), piece.pixels.data(),
                                      piece.width, piece.height);
-        video->draw_image(resource.c_str(), local_x, local_y, 0.0f,
+        video->draw_image(resource.c_str(), static_cast<float>(local.x),
+                          static_cast<float>(local.y), 0.0f,
                           0.0f, 0.0f, local_rotation,
                           1.0f, 1.0f, 1.0f, 1.0f);
     }
+    if (visualize_region.value) drawPhysicsRegion(video, region, transform);
     if (video->set_default_anchor) video->set_default_anchor(0, 0);
     return false;
 }
@@ -557,7 +687,7 @@ FILTER_PLUGIN_TABLE filter = {
     FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_USERDATA,
     L"テキスト分解物理",
     L"テキスト分解物理",
-    L"Standalone Text Decomposition Physics version 0.1.1 (Box2D 3.2.0)",
+    L"Standalone Text Decomposition Physics version 0.1.2 (Box2D 3.2.0)",
     items,
     processVideo,
     nullptr,
