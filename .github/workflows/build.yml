@@ -41,3 +41,25 @@ jobs:
           name: TextPhysicsFilter-${{ github.sha }}
           path: build/Release/TextPhysicsFilter.auf2
           if-no-files-found: error
+
+  host-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SDK_REPOSITORY }}
+          ref: ${{ env.SDK_REF }}
+          path: aviutl2_sdk
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTEXTPHYSICS_HOST_TEST=ON
+          -DAVIUTL2_SDK_DIR="${{ github.workspace }}/aviutl2_sdk/include/aviutl2_sdk"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

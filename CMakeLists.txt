@@ -23,6 +23,16 @@ FetchContent_Declare(box2d
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(box2d)
 
+option(TEXTPHYSICS_HOST_TEST "Build the host-mock test (Linux, no AviUtl2 needed) instead of the plugin" OFF)
+if(TEXTPHYSICS_HOST_TEST)
+    enable_testing()
+    add_executable(host_mock_test tests/host_mock_test.cpp)
+    target_include_directories(host_mock_test PRIVATE tests/stub "${AVIUTL2_SDK_DIR}")
+    target_link_libraries(host_mock_test PRIVATE box2d)
+    add_test(NAME host_mock_test COMMAND host_mock_test)
+    return()
+endif()
+
 add_library(TextPhysicsFilter MODULE TextPhysicsFilter.cpp AlphaComponentSegmentation.h)
 target_include_directories(TextPhysicsFilter PRIVATE "${AVIUTL2_SDK_DIR}")
 target_link_libraries(TextPhysicsFilter PRIVATE box2d)

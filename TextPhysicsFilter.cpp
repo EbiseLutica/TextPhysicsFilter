@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -41,6 +42,7 @@ FILTER_ITEM_SELECT::ITEM split_modes[] = {
     {nullptr},
 };
 auto static_object = FILTER_ITEM_CHECK(L"静的オブジェクトにする", false);
+auto collision_group = FILTER_ITEM_TRACK(L"衝突グループ", 0.0, 0.0, 99.0, 1.0);
 auto split_mode = FILTER_ITEM_SELECT(L"分割単位", 0, split_modes);
 auto alpha_threshold = FILTER_ITEM_TRACK(L"αしきい値", 1.0, 1.0, 255.0, 1.0);
 auto gravity = FILTER_ITEM_TRACK(L"重力", 1800.0, -100000.0, 100000.0, 1.0);
@@ -63,6 +65,7 @@ auto sleep_speed = FILTER_ITEM_TRACK(L"停止速度", 15.0, 0.0, 500.0, 1.0);
 
 void* items[] = {
     &static_object,
+    &collision_group,
     &split_mode,
     &alpha_threshold,
     &gravity,
@@ -111,6 +114,27 @@ struct ObjectTransform2D {
     double scale_y = 1.0;
 };
 
+// Everything a text object contributes to the physics world. The world level
+// fields (gravity, region, substeps, boundary) are taken from the group leader.
+struct ObjectParams {
+    double gravity = 1800.0;
+    double gravity_scale = 1.0;
+    double friction = 0.5;
+    double restitution = 0.0;
+    double density = 1.0;
+    double initial_speed = 0.0;
+    double initial_angle = 0.0;
+    double angular_velocity = 0.0;
+    double region_center_x = 0.0;
+    double region_center_y = 0.0;
+    double region_width_percent = 100.0;
+    double region_height_percent = 100.0;
+    double substeps = 4.0;
+    double sleep_speed = 15.0;
+    bool tumble = true;
+    bool boundary_collision = true;
+};
+
 struct Piece {
     int min_x = 0;
     int min_y = 0;
@@ -131,6 +155,18 @@ struct TerrainSource {
     std::vector<Piece> pieces;
 };
 
+// Another text object of the same collision group. Its pieces are simulated in
+// this instance's world but never drawn here.
+struct Neighbor {
+    int layer = 0;
+    int frame_start = 0;
+    int frame_end = 0;
+    std::uint64_t signature = 0;
+    OBJECT_IMAGE_PARAM start{};
+    ObjectParams params;
+    std::vector<Piece> pieces;
+};
+
 struct Runtime {
     std::mutex mutex;
     bool pieces_valid = false;
@@ -142,6 +178,7 @@ struct Runtime {
     std::wstring font;
     std::vector<Piece> pieces;
     std::vector<TerrainSource> terrains;
+    std::vector<Neighbor> members;
     b2WorldId world = b2_nullWorldId;
     bool simulation_valid = false;
     std::uint64_t simulation_key = 0;
@@ -157,6 +194,9 @@ struct Runtime {
         simulation_valid = false;
         cached_frame = 0;
         for (auto& piece : pieces) piece.body = b2_nullBodyId;
+        for (auto& member : members) {
+            for (auto& piece : member.pieces) piece.body = b2_nullBodyId;
+        }
     }
 };
 
@@ -167,6 +207,38 @@ void hashValue(std::uint64_t& hash, const T& value) {
         hash ^= bytes[i];
         hash *= 1099511628211ull;
     }
+}
+
+ObjectParams ownParams() {
+    ObjectParams p;
+    p.gravity = gravity.value;
+    p.gravity_scale = gravity_scale.value;
+    p.friction = friction.value;
+    p.restitution = restitution.value;
+    p.density = density.value;
+    p.initial_speed = initial_speed.value;
+    p.initial_angle = initial_angle.value;
+    p.angular_velocity = angular_velocity.value;
+    p.region_center_x = region_center_x.value;
+    p.region_center_y = region_center_y.value;
+    p.region_width_percent = region_width_percent.value;
+    p.region_height_percent = region_height_percent.value;
+    p.substeps = substeps.value;
+    p.sleep_speed = sleep_speed.value;
+    p.tumble = tumble.value;
+    p.boundary_collision = boundary_collision.value;
+    return p;
+}
+
+void hashParams(std::uint64_t& hash, const ObjectParams& p) {
+    hashValue(hash, p.gravity); hashValue(hash, p.gravity_scale);
+    hashValue(hash, p.friction); hashValue(hash, p.restitution); hashValue(hash, p.density);
+    hashValue(hash, p.initial_speed); hashValue(hash, p.initial_angle);
+    hashValue(hash, p.angular_velocity); hashValue(hash, p.tumble);
+    hashValue(hash, p.boundary_collision);
+    hashValue(hash, p.region_center_x); hashValue(hash, p.region_center_y);
+    hashValue(hash, p.region_width_percent); hashValue(hash, p.region_height_percent);
+    hashValue(hash, p.substeps); hashValue(hash, p.sleep_speed);
 }
 
 float meters(double pixels) {
@@ -189,12 +261,12 @@ double angleFromBox(float radians) {
     return -static_cast<double>(radians) * 180.0 / kPi;
 }
 
-PhysicsRegion makePhysicsRegion(const SCENE_INFO& scene) {
-    const double width_percent = std::clamp(region_width_percent.value, 1.0, 1000.0);
-    const double height_percent = std::clamp(region_height_percent.value, 1.0, 1000.0);
+PhysicsRegion makePhysicsRegion(const SCENE_INFO& scene, const ObjectParams& params) {
+    const double width_percent = std::clamp(params.region_width_percent, 1.0, 1000.0);
+    const double height_percent = std::clamp(params.region_height_percent, 1.0, 1000.0);
     return {
-        region_center_x.value,
-        region_center_y.value,
+        params.region_center_x,
+        params.region_center_y,
         std::max(1.0, scene.width * width_percent / 100.0),
         std::max(1.0, scene.height * height_percent / 100.0),
     };
@@ -295,13 +367,62 @@ std::wstring utf8ToWide(const char* text) {
     return result;
 }
 
+std::wstring readTextItemOf(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR item) {
+    if (!edit || !object || !edit->get_object_item_value) return {};
+    return utf8ToWide(edit->get_object_item_value(object, L"テキスト", item));
+}
+
 std::wstring readTextItem(FILTER_PROC_VIDEO* video, LPCWSTR item) {
-    if (!video || !video->edit || !video->edit->find_object ||
-        !video->edit->get_object_item_value) return {};
+    if (!video || !video->edit || !video->edit->find_object) return {};
     const OBJECT_HANDLE object = video->edit->find_object(video->object->layer,
                                                            video->object->frame_s);
-    return object ? utf8ToWide(video->edit->get_object_item_value(
-                        object, L"テキスト", item)) : std::wstring{};
+    return readTextItemOf(video->edit, object, item);
+}
+
+// Settings of this filter on another object, as strings from its alias data.
+double readNumberItem(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR item, double fallback) {
+    const char* value = edit->get_object_item_value(object, kFilterName, item);
+    if (!value || !*value) return fallback;
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    return end == value ? fallback : parsed;
+}
+
+bool readBoolItem(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR item, bool fallback) {
+    const char* value = edit->get_object_item_value(object, kFilterName, item);
+    if (!value || !*value) return fallback;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+}
+
+int readSplitMode(EDIT_SECTION* edit, OBJECT_HANDLE object, int fallback) {
+    const char* value = edit->get_object_item_value(object, kFilterName, split_mode.name);
+    if (!value || !*value) return fallback;
+    if (std::strcmp(value, "1") == 0) return 1;
+    return utf8ToWide(value) == L"文字内のαパーツ" ? 1 : 0;
+}
+
+ObjectParams readParams(EDIT_SECTION* edit, OBJECT_HANDLE object, const ObjectParams& base) {
+    ObjectParams p = base;
+    p.gravity = readNumberItem(edit, object, gravity.name, base.gravity);
+    p.gravity_scale = readNumberItem(edit, object, gravity_scale.name, base.gravity_scale);
+    p.friction = readNumberItem(edit, object, friction.name, base.friction);
+    p.restitution = readNumberItem(edit, object, restitution.name, base.restitution);
+    p.density = readNumberItem(edit, object, density.name, base.density);
+    p.initial_speed = readNumberItem(edit, object, initial_speed.name, base.initial_speed);
+    p.initial_angle = readNumberItem(edit, object, initial_angle.name, base.initial_angle);
+    p.angular_velocity = readNumberItem(edit, object, angular_velocity.name, base.angular_velocity);
+    p.region_center_x = readNumberItem(edit, object, region_center_x.name, base.region_center_x);
+    p.region_center_y = readNumberItem(edit, object, region_center_y.name, base.region_center_y);
+    p.region_width_percent = readNumberItem(edit, object, region_width_percent.name,
+                                            base.region_width_percent);
+    p.region_height_percent = readNumberItem(edit, object, region_height_percent.name,
+                                             base.region_height_percent);
+    p.substeps = readNumberItem(edit, object, substeps.name, base.substeps);
+    p.sleep_speed = readNumberItem(edit, object, sleep_speed.name, base.sleep_speed);
+    p.tumble = readBoolItem(edit, object, tumble.name, base.tumble);
+    p.boundary_collision = readBoolItem(edit, object, boundary_collision.name,
+                                        base.boundary_collision);
+    return p;
 }
 
 std::vector<int> lineLengths(const std::wstring& text) {
@@ -521,7 +642,8 @@ void createPieceShape(b2BodyId body, const Piece& piece,
     b2CreatePolygonShape(body, &shape_definition, &box);
 }
 
-void addTerrainBodies(b2WorldId world, const TerrainSource& terrain, double bounce) {
+void addTerrainBodies(b2WorldId world, const TerrainSource& terrain,
+                      double body_friction, double bounce) {
     for (const auto& piece : terrain.pieces) {
         b2BodyDef body_definition = b2DefaultBodyDef();
         body_definition.type = b2_staticBody;
@@ -529,25 +651,26 @@ void addTerrainBodies(b2WorldId world, const TerrainSource& terrain, double boun
         body_definition.rotation = b2MakeRot(angleToBox(terrain.pose.rz));
         const b2BodyId body = b2CreateBody(world, &body_definition);
         b2ShapeDef shape_definition = b2DefaultShapeDef();
-        shape_definition.material.friction = static_cast<float>(friction.value);
+        shape_definition.material.friction = static_cast<float>(body_friction);
         shape_definition.material.restitution = static_cast<float>(bounce);
         createPieceShape(body, piece, shape_definition, terrain.pose);
     }
 }
 
-bool isStaticObject(EDIT_SECTION* edit, OBJECT_HANDLE object) {
-    if (!edit->count_object_effect || !edit->get_object_item_value ||
-        edit->count_object_effect(object, kFilterName) <= 0) return false;
-    const char* value = edit->get_object_item_value(object, kFilterName, kStaticItemName);
-    return value && *value && std::strcmp(value, "0") != 0 &&
-           std::strcmp(value, "false") != 0;
-}
+// Set while this thread reads another layer's image so a nested call of the
+// filter passes straight through instead of touching any simulation.
+thread_local bool fetching_layer_image = false;
 
 bool fetchLayerImage(FILTER_PROC_VIDEO* video, int layer,
                      std::vector<PIXEL_RGBA>& pixels, int& width, int& height) {
     if (!video->copy_image_resource || !video->get_image_resource_size ||
         !video->get_image_resource_data || !video->release_image_resource) return false;
-    const std::wstring resource = L"resource:text_physics_terrain_" + std::to_wstring(layer);
+    struct Guard {
+        Guard() { fetching_layer_image = true; }
+        ~Guard() { fetching_layer_image = false; }
+    } guard;
+    const std::wstring resource = L"resource:text_physics_fetch_" +
+        std::to_wstring(video->object->effect_id) + L"_" + std::to_wstring(layer);
     const std::wstring source = L"layer:" + std::to_wstring(layer);
     bool ok = video->copy_image_resource(resource.c_str(), source.c_str()) &&
               video->get_image_resource_size(resource.c_str(), &width, &height) &&
@@ -562,102 +685,151 @@ bool fetchLayerImage(FILTER_PROC_VIDEO* video, int layer,
     return ok;
 }
 
-// Looks for other layers whose text carries this filter with the static flag on.
-// Pixels are read back only when an object's alias or pose changes.
-void refreshTerrains(Runtime& runtime, FILTER_PROC_VIDEO* video, int threshold) {
-    std::vector<TerrainSource> found;
+std::uint64_t hashAlias(EDIT_SECTION* edit, OBJECT_HANDLE object) {
+    std::uint64_t hash = 1469598103934665603ull;
+    const char* alias = edit->get_object_alias ? edit->get_object_alias(object) : nullptr;
+    if (alias) {
+        for (const char* c = alias; *c; ++c) hashValue(hash, *c);
+    }
+    return hash;
+}
+
+void logNeighbor(const wchar_t* kind, int layer, std::size_t pieces) {
+    const std::wstring message = std::wstring(L"[TextPhysicsFilter] ") + kind +
+        L" layer=" + std::to_wstring(layer) + L" pieces=" + std::to_wstring(pieces) + L"\n";
+    OutputDebugStringW(message.c_str());
+}
+
+// Scans the other layers for text objects carrying this filter: static ones become
+// terrain, and (when this object has a collision group) non-static ones of the same
+// group become members of the world. Pixels are read back only when an object's
+// alias, pose or timing changes.
+void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, const ObjectParams& own,
+                      int group, int now_frame, int threshold) {
+    std::vector<TerrainSource> terrains;
+    std::vector<Neighbor> members;
     EDIT_SECTION* edit = video->edit;
-    if (edit && video->get_image_object) {
+    const double frame_seconds = static_cast<double>(video->scene->scale) / video->scene->rate;
+    const auto fetchPieces = [&](int layer, int piece_threshold, int piece_mode,
+                                 const std::wstring& text) {
+        std::vector<Piece> pieces;
+        std::vector<PIXEL_RGBA> pixels;
+        int width = 0, height = 0;
+        if (fetchLayerImage(video, layer, pixels, width, height)) {
+            pieces = buildPieces(pixels, width, height, piece_threshold, piece_mode, text);
+            for (auto& piece : pieces) {
+                piece.pixels.clear();
+                piece.pixels.shrink_to_fit();
+            }
+        }
+        return pieces;
+    };
+    if (edit && video->get_image_object && edit->get_object_item_value &&
+        edit->count_object_effect && edit->get_object_layer_frame) {
         const int layer_max = edit->info
             ? std::clamp(edit->info->layer_max, 0, kMaximumTerrainLayers - 1)
             : kMaximumTerrainLayers - 1;
         for (int layer = 0; layer <= layer_max; ++layer) {
             if (layer == video->object->layer) continue;
             const OBJECT_HANDLE object = video->get_image_object(layer, 0.0);
-            if (!object || object == video->object->handle || !isStaticObject(edit, object)) continue;
-            TerrainSource terrain;
-            terrain.layer = layer;
-            terrain.pose.sx = terrain.pose.sy = terrain.pose.sz = 1.0f;
-            terrain.pose.alpha = 1.0f;
-            if (!video->get_output_image_param ||
-                !video->get_output_image_param(object, -video->object->time,
-                                               &terrain.pose, sizeof(terrain.pose))) {
+            if (!object || object == video->object->handle ||
+                edit->count_object_effect(object, kFilterName) <= 0) continue;
+
+            if (readBoolItem(edit, object, kStaticItemName, false)) {
+                TerrainSource terrain;
+                terrain.layer = layer;
+                terrain.pose.sx = terrain.pose.sy = terrain.pose.sz = 1.0f;
+                terrain.pose.alpha = 1.0f;
                 if (!video->get_output_image_param ||
-                    !video->get_output_image_param(object, 0.0, &terrain.pose,
-                                                   sizeof(terrain.pose))) continue;
+                    (!video->get_output_image_param(object, -video->object->time,
+                                                    &terrain.pose, sizeof(terrain.pose)) &&
+                     !video->get_output_image_param(object, 0.0, &terrain.pose,
+                                                    sizeof(terrain.pose)))) continue;
+                std::uint64_t signature = hashAlias(edit, object);
+                hashValue(signature, terrain.pose);
+                hashValue(signature, threshold);
+                terrain.signature = signature;
+                const auto cached = std::find_if(runtime.terrains.begin(), runtime.terrains.end(),
+                    [&](const TerrainSource& old) {
+                        return old.layer == layer && old.signature == signature;
+                    });
+                if (cached != runtime.terrains.end()) {
+                    terrain.pieces = std::move(cached->pieces);
+                } else {
+                    terrain.pieces = fetchPieces(layer, threshold, 1, {});
+                    logNeighbor(L"terrain", layer, terrain.pieces.size());
+                }
+                terrains.push_back(std::move(terrain));
+                continue;
             }
-            std::uint64_t signature = 1469598103934665603ull;
-            if (const char* alias = edit->get_object_alias ? edit->get_object_alias(object) : nullptr) {
-                for (const char* c = alias; *c; ++c) hashValue(signature, *c);
+
+            if (group <= 0 || std::lround(readNumberItem(
+                    edit, object, collision_group.name, 0.0)) != group) continue;
+            Neighbor member;
+            member.layer = layer;
+            const OBJECT_LAYER_FRAME range = edit->get_object_layer_frame(object);
+            member.frame_start = range.start;
+            member.frame_end = range.end;
+            member.start.sx = member.start.sy = member.start.sz = 1.0f;
+            member.start.alpha = 1.0f;
+            const double offset = (range.start - now_frame) * frame_seconds;
+            if (!video->get_output_image_param ||
+                (!video->get_output_image_param(object, offset, &member.start,
+                                                sizeof(member.start)) &&
+                 !video->get_output_image_param(object, 0.0, &member.start,
+                                                sizeof(member.start)))) continue;
+            member.params = readParams(edit, object, own);
+            const int member_threshold = std::clamp(static_cast<int>(std::lround(
+                readNumberItem(edit, object, alpha_threshold.name, threshold))), 1, 255);
+            const int member_mode = readSplitMode(edit, object, 0);
+            std::uint64_t signature = hashAlias(edit, object);
+            hashValue(signature, member.start);
+            hashValue(signature, layer);
+            hashValue(signature, range.start);
+            hashValue(signature, range.end);
+            hashValue(signature, member_threshold);
+            hashValue(signature, member_mode);
+            member.signature = signature;
+            const auto cached = std::find_if(runtime.members.begin(), runtime.members.end(),
+                [&](const Neighbor& old) {
+                    return old.layer == layer && old.signature == signature;
+                });
+            if (cached != runtime.members.end()) {
+                member.pieces = std::move(cached->pieces);
+            } else {
+                member.pieces = fetchPieces(layer, member_threshold, member_mode,
+                                            readTextItemOf(edit, object, L"テキスト"));
+                logNeighbor(L"member", layer, member.pieces.size());
             }
-            hashValue(signature, terrain.pose);
-            hashValue(signature, threshold);
-            terrain.signature = signature;
-            found.push_back(std::move(terrain));
+            members.push_back(std::move(member));
         }
     }
-    for (auto& terrain : found) {
-        const auto cached = std::find_if(runtime.terrains.begin(), runtime.terrains.end(),
-            [&](const TerrainSource& old) {
-                return old.layer == terrain.layer && old.signature == terrain.signature;
-            });
-        if (cached != runtime.terrains.end()) {
-            terrain.pieces = std::move(cached->pieces);
-            continue;
-        }
-        std::vector<PIXEL_RGBA> pixels;
-        int width = 0, height = 0;
-        if (fetchLayerImage(video, terrain.layer, pixels, width, height)) {
-            terrain.pieces = buildPieces(pixels, width, height, threshold, 1, {});
-            for (auto& piece : terrain.pieces) {
-                piece.pixels.clear();
-                piece.pixels.shrink_to_fit();
-            }
-        }
-        const std::wstring message = L"[TextPhysicsFilter] terrain layer=" +
-            std::to_wstring(terrain.layer) + L" pieces=" +
-            std::to_wstring(terrain.pieces.size()) + L"\n";
-        OutputDebugStringW(message.c_str());
-    }
-    runtime.terrains = std::move(found);
+    runtime.terrains = std::move(terrains);
+    runtime.members = std::move(members);
 }
 
-bool resetSimulation(Runtime& runtime, FILTER_PROC_VIDEO* video,
-                     const OBJECT_IMAGE_PARAM& start,
-                     const PhysicsRegion& region, std::uint64_t key) {
-    runtime.destroyWorld();
-    b2WorldDef world_definition = b2DefaultWorldDef();
-    world_definition.gravity = {0.0f, -meters(gravity.value)};
-    runtime.world = b2CreateWorld(&world_definition);
-    if (B2_IS_NULL(runtime.world)) return false;
+// One text object taking part in the simulation: this instance's own object or a
+// member of its collision group.
+struct SimEntry {
+    int layer;
+    int frame_start;
+    int frame_end;
+    bool self;
+    const OBJECT_IMAGE_PARAM* start;
+    const ObjectParams* params;
+    std::vector<Piece>* pieces;
+};
 
-    const double bounce = std::clamp(restitution.value, 0.0, 1.0);
-    if (boundary_collision.value) {
-        constexpr double thickness = kPixelsPerMeter;
-        createBox(runtime.world, region.center_x,
-                  region.bottom() + thickness * 0.5,
-                  region.width + thickness * 2.0, thickness,
-                  false, friction.value, bounce, 1.0);
-        createBox(runtime.world, region.center_x,
-                  region.top() - thickness * 0.5,
-                  region.width + thickness * 2.0, thickness,
-                  false, friction.value, bounce, 1.0);
-        createBox(runtime.world, region.left() - thickness * 0.5,
-                  region.center_y, thickness, region.height,
-                  false, friction.value, bounce, 1.0);
-        createBox(runtime.world, region.right() + thickness * 0.5,
-                  region.center_y, thickness, region.height,
-                  false, friction.value, bounce, 1.0);
-    }
-
-    for (const auto& terrain : runtime.terrains) addTerrainBodies(runtime.world, terrain, bounce);
-
-    const double launch_radians = initial_angle.value * kPi / 180.0;
-    const double velocity_x = std::sin(launch_radians) * initial_speed.value;
-    const double velocity_y = -std::cos(launch_radians) * initial_speed.value;
-    for (std::size_t index = 0; index < runtime.pieces.size(); ++index) {
-        auto& piece = runtime.pieces[index];
-        const bool tumble_enabled = tumble.value;
+void spawnEntry(b2WorldId world, const SimEntry& entry) {
+    const ObjectParams& params = *entry.params;
+    const OBJECT_IMAGE_PARAM& start = *entry.start;
+    const double bounce = std::clamp(params.restitution, 0.0, 1.0);
+    const double launch_radians = params.initial_angle * kPi / 180.0;
+    const double velocity_x = std::sin(launch_radians) * params.initial_speed;
+    const double velocity_y = -std::cos(launch_radians) * params.initial_speed;
+    for (std::size_t index = 0; index < entry.pieces->size(); ++index) {
+        auto& piece = (*entry.pieces)[index];
+        const bool tumble_enabled = params.tumble;
         b2BodyDef body_definition = b2DefaultBodyDef();
         body_definition.type = b2_dynamicBody;
         body_definition.position = pieceWorldPosition(piece, start);
@@ -665,36 +837,96 @@ bool resetSimulation(Runtime& runtime, FILTER_PROC_VIDEO* video,
             static_cast<int>(index)) : 0.0);
         body_definition.rotation = b2MakeRot(angleToBox(rotation));
         body_definition.linearVelocity = vectorToBox(velocity_x, velocity_y);
-        const double configured_angular_velocity = std::abs(angular_velocity.value) >= 0.001
-            ? angular_velocity.value
+        const double configured_angular_velocity = std::abs(params.angular_velocity) >= 0.001
+            ? params.angular_velocity
             : (tumble_enabled ? tumbleVelocity(static_cast<int>(index)) : 0.0);
         body_definition.angularVelocity = angleToBox(configured_angular_velocity);
         body_definition.angularDamping = tumble_enabled ? 2.0f : 4.0f;
         body_definition.motionLocks.angularZ = !tumble_enabled &&
-                                               std::abs(angular_velocity.value) < 0.001;
-        body_definition.gravityScale = static_cast<float>(gravity_scale.value);
-        body_definition.sleepThreshold = meters(std::max(0.0, sleep_speed.value));
-        const b2BodyId body = b2CreateBody(runtime.world, &body_definition);
+                                               std::abs(params.angular_velocity) < 0.001;
+        body_definition.gravityScale = static_cast<float>(params.gravity_scale);
+        body_definition.sleepThreshold = meters(std::max(0.0, params.sleep_speed));
+        const b2BodyId body = b2CreateBody(world, &body_definition);
 
         b2ShapeDef shape_definition = b2DefaultShapeDef();
-        shape_definition.material.friction = static_cast<float>(friction.value);
+        shape_definition.material.friction = static_cast<float>(params.friction);
         shape_definition.material.restitution = static_cast<float>(bounce);
-        shape_definition.density = static_cast<float>(density.value);
+        shape_definition.density = static_cast<float>(params.density);
         createPieceShape(body, piece, shape_definition, start);
         b2Body_UpdateMassFromShapes(body);
         piece.body = body;
     }
+}
+
+void removeEntry(const SimEntry& entry) {
+    for (auto& piece : *entry.pieces) {
+        if (B2_IS_NON_NULL(piece.body) && b2Body_IsValid(piece.body)) b2DestroyBody(piece.body);
+        piece.body = b2_nullBodyId;
+    }
+}
+
+// Entries are in spawn order. The world clock is the scene frame; every entry
+// appears at its own start frame and members disappear after their last frame.
+bool resetSimulation(Runtime& runtime, const std::vector<SimEntry>& entries,
+                     const ObjectParams& world_params, const PhysicsRegion& region,
+                     std::uint64_t key, int world_start) {
+    runtime.destroyWorld();
+    b2WorldDef world_definition = b2DefaultWorldDef();
+    world_definition.gravity = {0.0f, -meters(world_params.gravity)};
+    runtime.world = b2CreateWorld(&world_definition);
+    if (B2_IS_NULL(runtime.world)) return false;
+
+    const double bounce = std::clamp(world_params.restitution, 0.0, 1.0);
+    if (world_params.boundary_collision) {
+        constexpr double thickness = kPixelsPerMeter;
+        createBox(runtime.world, region.center_x,
+                  region.bottom() + thickness * 0.5,
+                  region.width + thickness * 2.0, thickness,
+                  false, world_params.friction, bounce, 1.0);
+        createBox(runtime.world, region.center_x,
+                  region.top() - thickness * 0.5,
+                  region.width + thickness * 2.0, thickness,
+                  false, world_params.friction, bounce, 1.0);
+        createBox(runtime.world, region.left() - thickness * 0.5,
+                  region.center_y, thickness, region.height,
+                  false, world_params.friction, bounce, 1.0);
+        createBox(runtime.world, region.right() + thickness * 0.5,
+                  region.center_y, thickness, region.height,
+                  false, world_params.friction, bounce, 1.0);
+    }
+
+    for (const auto& terrain : runtime.terrains) {
+        addTerrainBodies(runtime.world, terrain, world_params.friction, bounce);
+    }
+    for (const auto& entry : entries) {
+        if (entry.frame_start == world_start) spawnEntry(runtime.world, entry);
+    }
     runtime.simulation_valid = true;
     runtime.simulation_key = key;
-    runtime.cached_frame = 0;
+    runtime.cached_frame = world_start;
     return true;
+}
+
+void advanceSimulation(Runtime& runtime, const std::vector<SimEntry>& entries,
+                       const ObjectParams& world_params, int target_frame,
+                       double frame_seconds) {
+    const int sub_steps = std::clamp(static_cast<int>(std::lround(world_params.substeps)), 1, 16);
+    for (int frame = runtime.cached_frame; frame < target_frame; ++frame) {
+        b2World_Step(runtime.world, static_cast<float>(frame_seconds), sub_steps);
+        const int next = frame + 1;
+        for (const auto& entry : entries) {
+            if (entry.frame_start == next) spawnEntry(runtime.world, entry);
+            else if (!entry.self && entry.frame_end + 1 == next) removeEntry(entry);
+        }
+    }
+    runtime.cached_frame = std::max(runtime.cached_frame, target_frame);
 }
 
 bool processVideo(FILTER_PROC_VIDEO* video) {
     if (!video || !video->scene || !video->object || video->scene->rate <= 0 ||
         !video->get_image_data || !video->create_image_resource || !video->draw_image) return true;
     auto* runtime = static_cast<Runtime*>(video->userdata);
-    if (!runtime) return true;
+    if (!runtime || fetching_layer_image) return true;
     // Static objects are left untouched; other instances read them as terrain.
     if (static_object.value) return true;
     std::lock_guard<std::mutex> lock(runtime->mutex);
@@ -720,7 +952,7 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
         runtime->font = font;
         runtime->destroyWorld();
     }
-    const PhysicsRegion region = makePhysicsRegion(*video->scene);
+    const ObjectParams own = ownParams();
     if (runtime->pieces.empty()) {
         if (visualize_region.value) {
             OBJECT_IMAGE_PARAM current{};
@@ -729,7 +961,8 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
             if (video->get_output_image_param) {
                 video->get_output_image_param(nullptr, 0.0, &current, sizeof(current));
             }
-            drawPhysicsRegion(video, region, makeObjectTransform(current));
+            drawPhysicsRegion(video, makePhysicsRegion(*video->scene, own),
+                              makeObjectTransform(current));
         }
         if (video->set_default_anchor) video->set_default_anchor(0, 0);
         return false;
@@ -741,38 +974,59 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
     if (video->get_output_image_param) {
         video->get_output_image_param(nullptr, -video->object->time, &start, sizeof(start));
     }
-    refreshTerrains(*runtime, video, threshold);
+    const int group = std::clamp(static_cast<int>(std::lround(collision_group.value)), 0, 99);
+    const int frame = std::max(0, video->object->frame);
+    const int now_frame = video->object->frame_s + frame;
+    refreshNeighbors(*runtime, video, own, group, now_frame, threshold);
+
+    std::vector<SimEntry> entries;
+    entries.push_back({video->object->layer, video->object->frame_s, video->object->frame_e,
+                       true, &start, &own, &runtime->pieces});
+    for (auto& member : runtime->members) {
+        entries.push_back({member.layer, member.frame_start, member.frame_end,
+                           false, &member.start, &member.params, &member.pieces});
+    }
+    std::sort(entries.begin(), entries.end(), [](const SimEntry& a, const SimEntry& b) {
+        return a.frame_start != b.frame_start ? a.frame_start < b.frame_start : a.layer < b.layer;
+    });
+    // The group leader (lowest layer) decides the world level settings.
+    const SimEntry* leader = &entries.front();
+    for (const auto& entry : entries) {
+        if (entry.layer < leader->layer) leader = &entry;
+    }
+    const ObjectParams& world_params = *leader->params;
+    const PhysicsRegion region = makePhysicsRegion(*video->scene, world_params);
+    const int world_start = entries.front().frame_start;
+
     std::uint64_t key = 1469598103934665603ull;
     hashValue(key, width); hashValue(key, height);
     hashValue(key, video->scene->width); hashValue(key, video->scene->height);
     hashValue(key, threshold); hashValue(key, mode);
-    hashValue(key, gravity.value); hashValue(key, gravity_scale.value);
-    hashValue(key, friction.value); hashValue(key, restitution.value); hashValue(key, density.value);
-    hashValue(key, initial_speed.value); hashValue(key, initial_angle.value);
-    hashValue(key, angular_velocity.value); hashValue(key, tumble.value);
-    hashValue(key, boundary_collision.value);
-    hashValue(key, region_center_x.value); hashValue(key, region_center_y.value);
-    hashValue(key, region_width_percent.value); hashValue(key, region_height_percent.value);
-    hashValue(key, substeps.value); hashValue(key, sleep_speed.value);
-    hashValue(key, start);
-    hashValue(key, runtime->pieces.size());
+    hashParams(key, world_params);
+    for (const auto& entry : entries) {
+        hashValue(key, entry.layer);
+        hashValue(key, entry.frame_start);
+        hashValue(key, entry.frame_end);
+        hashValue(key, entry.self);
+        hashValue(key, *entry.start);
+        hashParams(key, *entry.params);
+        hashValue(key, entry.pieces->size());
+    }
+    for (const auto& member : runtime->members) hashValue(key, member.signature);
     for (const auto& terrain : runtime->terrains) {
         hashValue(key, terrain.layer);
         hashValue(key, terrain.signature);
     }
     for (const wchar_t character : text) hashValue(key, character);
 
-    const int frame = std::max(0, video->object->frame);
     if (!runtime->simulation_valid || runtime->simulation_key != key ||
-        frame < runtime->cached_frame) {
-        if (!resetSimulation(*runtime, video, start, region, key)) return true;
+        now_frame < runtime->cached_frame) {
+        if (!resetSimulation(*runtime, entries, world_params, region, key, world_start)) {
+            return true;
+        }
     }
-    const double frame_seconds = static_cast<double>(video->scene->scale) / video->scene->rate;
-    for (int simulated = runtime->cached_frame; simulated < frame; ++simulated) {
-        b2World_Step(runtime->world, static_cast<float>(frame_seconds),
-                     std::clamp(static_cast<int>(std::lround(substeps.value)), 1, 16));
-    }
-    runtime->cached_frame = frame;
+    advanceSimulation(*runtime, entries, world_params, now_frame,
+                      static_cast<double>(video->scene->scale) / video->scene->rate);
 
     OBJECT_IMAGE_PARAM current{};
     current.sx = current.sy = current.sz = 1.0f;
@@ -817,7 +1071,7 @@ FILTER_PLUGIN_TABLE filter = {
     FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_USERDATA,
     L"テキスト分解物理",
     L"テキスト分解物理",
-    L"Standalone Text Decomposition Physics version 0.1.3-terrain (Box2D 3.2.0)",
+    L"Standalone Text Decomposition Physics version 0.1.4-group (Box2D 3.2.0)",
     items,
     processVideo,
     nullptr,
