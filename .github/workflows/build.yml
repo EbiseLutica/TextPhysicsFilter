@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Unofficial mirror of the AviUtl2 plugin SDK, pinned to a commit.
+  SDK_REPOSITORY: aviutl2/aviutl2_sdk_mirror
+  SDK_REF: 7d2af438c32b4cea66c6a30e69b9dab9229c2032
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SDK_REPOSITORY }}
+          ref: ${{ env.SDK_REF }}
+          path: aviutl2_sdk
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64
+          -DAVIUTL2_SDK_DIR="${{ github.workspace }}/aviutl2_sdk/include/aviutl2_sdk"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Check output
+        shell: bash
+        run: |
+          ls -l build/Release
+          test -f build/Release/TextPhysicsFilter.auf2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TextPhysicsFilter-${{ github.sha }}
+          path: build/Release/TextPhysicsFilter.auf2
+          if-no-files-found: error
