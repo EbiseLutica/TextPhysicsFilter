@@ -180,6 +180,7 @@ struct Runtime {
     int mode = 0;
     std::wstring text;
     std::wstring font;
+    double text_size = 0.0;
     std::vector<Piece> pieces;
     std::vector<TerrainSource> terrains;
     std::vector<Neighbor> members;
@@ -383,6 +384,12 @@ std::wstring readTextItem(FILTER_PROC_VIDEO* video, LPCWSTR item) {
     return readTextItemOf(video->edit, object, item);
 }
 
+double parseNumber(const std::wstring& text) {
+    wchar_t* end = nullptr;
+    const double value = std::wcstod(text.c_str(), &end);
+    return end == text.c_str() ? 0.0 : value;
+}
+
 // Settings of this filter on another object, as strings from its alias data.
 double readNumberItem(EDIT_SECTION* edit, OBJECT_HANDLE object, LPCWSTR item, double fallback) {
     const char* value = edit->get_object_item_value(object, kFilterName, item);
@@ -453,6 +460,7 @@ struct LineLayout {
     int first = 0;
     int last = -1;
     double total = 0.0;
+    double height = 0.0;  // largest font size on the line
 
     // Index of the character at x, given the ink extent [left, right] of the line.
     int column(double x, double left, double right) const {
@@ -468,38 +476,52 @@ struct LineLayout {
     }
 };
 
-// Removes AviUtl2 text control tags such as <s60>, <#ff0000>, <#>, <p+10,0>, <w1>, <c>.
-// They are not drawn, so they must not count as characters.
-std::wstring stripControlTags(const std::wstring& text) {
-    std::wstring result;
-    result.reserve(text.size());
-    for (std::size_t i = 0; i < text.size();) {
-        if (text[i] == L'<') {
-            std::size_t end = i + 1;
-            while (end < text.size() && text[end] != L'>' && text[end] != L'<' &&
-                   text[end] != L'\n') ++end;
-            if (end < text.size() && text[end] == L'>' && end > i + 1 &&
-                std::wcschr(L"sprcw#?/", text[i + 1])) {
-                const bool clears_line = text[i + 1] == L'c';
-                i = end + 1;
-                if (clears_line) {
-                    if (i < text.size() && text[i] == L'\r') ++i;
-                    if (i < text.size() && text[i] == L'\n') ++i;
-                }
-                continue;
-            }
-        }
-        result.push_back(text[i++]);
-    }
-    return result;
+// AviUtl2 text control tags such as <s60>, <#ff0000>, <#>, <p+10,0>, <w1>, <c> are not
+// drawn, so they do not count as characters. Returns true and the index of the closing
+// '>' when a tag starts at text[i].
+bool controlTagAt(const std::wstring& text, std::size_t i, std::size_t& end) {
+    if (text[i] != L'<') return false;
+    end = i + 1;
+    while (end < text.size() && text[end] != L'>' && text[end] != L'<' &&
+           text[end] != L'\n') ++end;
+    return end < text.size() && text[end] == L'>' && end > i + 1 &&
+           std::wcschr(L"sprcw#?/", text[i + 1]);
 }
 
-std::vector<LineLayout> lineLayouts(const std::wstring& raw_text) {
-    const std::wstring text = stripControlTags(raw_text);
+// Splits text into lines with the expected advance width of every character. <sN> sets
+// the font size to N pixels and <s> goes back to default_size (the object's size
+// setting); widths and line heights follow the size. When default_size is unknown (0)
+// size tags are ignored.
+std::vector<LineLayout> lineLayouts(const std::wstring& text, double default_size) {
     std::vector<LineLayout> layouts(1);
     std::vector<std::vector<bool>> blanks(1);
+    const double base = default_size > 0.0 ? default_size : 1.0;
+    double size = base;
     for (std::size_t i = 0; i < text.size(); ++i) {
         const wchar_t character = text[i];
+        std::size_t end = 0;
+        if (controlTagAt(text, i, end)) {
+            if (text[i + 1] == L's' && default_size > 0.0) {
+                const std::wstring content = text.substr(i + 2, end - i - 2);
+                if (content.empty()) {
+                    size = base;
+                } else {
+                    wchar_t* stop = nullptr;
+                    const double value = std::wcstod(content.c_str(), &stop);
+                    if (stop != content.c_str()) {
+                        if (content[0] == L'+' || content[0] == L'-') size = std::max(1.0, size + value);
+                        else if (value > 0.0) size = value;
+                    }
+                }
+            }
+            const bool clears_line = text[i + 1] == L'c';
+            i = end;
+            if (clears_line) {
+                if (i + 1 < text.size() && text[i + 1] == L'\r') ++i;
+                if (i + 1 < text.size() && text[i + 1] == L'\n') ++i;
+            }
+            continue;
+        }
         if (character == L'\r') continue;
         if (character == L'\n') {
             layouts.emplace_back();
@@ -508,7 +530,8 @@ std::vector<LineLayout> lineLayouts(const std::wstring& raw_text) {
         }
         if (character >= 0xd800 && character <= 0xdbff && i + 1 < text.size() &&
             text[i + 1] >= 0xdc00 && text[i + 1] <= 0xdfff) ++i;
-        layouts.back().weights.push_back(advanceWeight(character));
+        layouts.back().weights.push_back(advanceWeight(character) * size);
+        layouts.back().height = std::max(layouts.back().height, size);
         blanks.back().push_back(character == L' ' || character == 0x3000 || character == L'\t');
     }
     for (std::size_t line = 0; line < layouts.size(); ++line) {
@@ -519,13 +542,15 @@ std::vector<LineLayout> lineLayouts(const std::wstring& raw_text) {
         while (layout.first < count && blanks[line][layout.first]) ++layout.first;
         while (layout.last >= layout.first && blanks[line][layout.last]) --layout.last;
         for (int i = layout.first; i <= layout.last; ++i) layout.total += layout.weights[i];
+        if (layout.height <= 0.0) layout.height = base;
     }
     return layouts;
 }
 
 std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
                                int width, int height, int threshold,
-                               int mode, const std::wstring& text) {
+                               int mode, const std::wstring& text,
+                               double default_size = 0.0) {
     std::vector<std::uint8_t> alpha(static_cast<std::size_t>(width) * height);
     for (std::size_t i = 0; i < alpha.size(); ++i) alpha[i] = pixels[i].a;
     auto components = segmentPhysicsAlphaComponents(alpha, width, height, threshold);
@@ -538,7 +563,7 @@ std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
             groups[i].push_back(static_cast<int>(i));
         }
     } else {
-        const auto layouts = lineLayouts(text);
+        const auto layouts = lineLayouts(text, default_size);
         std::vector<int> lengths;
         for (const auto& layout : layouts) lengths.push_back(static_cast<int>(layout.weights.size()));
         int left = width, top = height, right = -1, bottom = -1;
@@ -556,14 +581,22 @@ std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
         }
         groups.resize(std::max(1, group_count));
         const double occupied_height = std::max(1, bottom - top + 1);
+        // Lines are as tall as their largest font size.
+        std::vector<double> line_bounds(layouts.size() + 1, 0.0);
+        for (std::size_t line = 0; line < layouts.size(); ++line) {
+            line_bounds[line + 1] = line_bounds[line] + layouts[line].height;
+        }
         std::vector<int> line_of(components.size(), 0);
         std::vector<double> line_left(lengths.size(), static_cast<double>(width));
         std::vector<double> line_right(lengths.size(), -1.0);
         for (std::size_t i = 0; i < components.size(); ++i) {
             const auto& component = components[i];
             const double center_y = (component.min_y + component.max_y + 1) * 0.5;
-            int line = std::clamp(static_cast<int>((center_y - top) *
-                                  lengths.size() / occupied_height),
+            const double position = std::clamp((center_y - top) / occupied_height, 0.0, 1.0) *
+                                    line_bounds.back();
+            int line = std::clamp(static_cast<int>(std::upper_bound(
+                                      line_bounds.begin() + 1, line_bounds.end(), position) -
+                                  (line_bounds.begin() + 1)),
                                   0, static_cast<int>(lengths.size()) - 1);
             while (line < static_cast<int>(lengths.size()) && lengths[line] == 0) ++line;
             if (line >= static_cast<int>(lengths.size())) {
@@ -811,6 +844,7 @@ struct ObjectInfo {
     ObjectParams params;
     OBJECT_IMAGE_PARAM start{};
     std::wstring text;
+    double text_size = 0.0;
 };
 
 struct ObjectKey {
@@ -881,6 +915,7 @@ std::shared_ptr<const ObjectInfo> getObjectInfo(FILTER_PROC_VIDEO* video, const 
     info->mode = readSplitMode(edit, item.handle, 0);
     info->params = readParams(edit, item.handle, ObjectParams{});
     info->text = readTextItemOf(edit, item.handle, L"テキスト");
+    info->text_size = parseNumber(readTextItemOf(edit, item.handle, L"サイズ"));
     info->start.sx = info->start.sy = info->start.sz = 1.0f;
     info->start.alpha = 1.0f;
     const double offset = (item.frame_start - now_frame) *
@@ -902,12 +937,12 @@ void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, int group, int
     std::vector<TerrainSource> terrains;
     std::vector<Neighbor> members;
     const auto fetchPieces = [&](int layer, int piece_threshold, int piece_mode,
-                                 const std::wstring& text) {
+                                 const std::wstring& text, double text_size) {
         std::vector<Piece> pieces;
         std::vector<PIXEL_RGBA> pixels;
         int width = 0, height = 0;
         if (fetchLayerImage(video, layer, pixels, width, height)) {
-            pieces = buildPieces(pixels, width, height, piece_threshold, piece_mode, text);
+            pieces = buildPieces(pixels, width, height, piece_threshold, piece_mode, text, text_size);
             for (auto& piece : pieces) {
                 piece.pixels.clear();
                 piece.pixels.shrink_to_fit();
@@ -937,7 +972,7 @@ void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, int group, int
             if (cached != runtime.terrains.end()) {
                 terrain.pieces = std::move(cached->pieces);
             } else {
-                terrain.pieces = fetchPieces(item.layer, info->threshold, 1, {});
+                terrain.pieces = fetchPieces(item.layer, info->threshold, 1, {}, 0.0);
                 logNeighbor(L"terrain", item.layer, terrain.pieces.size());
             }
             terrains.push_back(std::move(terrain));
@@ -957,7 +992,8 @@ void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, int group, int
         if (cached != runtime.members.end()) {
             member.pieces = std::move(cached->pieces);
         } else {
-            member.pieces = fetchPieces(item.layer, info->threshold, info->mode, info->text);
+            member.pieces = fetchPieces(item.layer, info->threshold, info->mode, info->text,
+                                        info->text_size);
             logNeighbor(L"member", item.layer, member.pieces.size());
         }
         members.push_back(std::move(member));
@@ -1095,14 +1131,17 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
     const int mode = split_mode.value == 1 ? 1 : 0;
     const std::wstring text = readTextItem(video, L"テキスト");
     const std::wstring font = readTextItem(video, L"フォント");
+    const double text_size = parseNumber(readTextItem(video, L"サイズ"));
     if (!runtime->pieces_valid || runtime->image_width != width ||
         runtime->image_height != height || runtime->threshold != threshold ||
-        runtime->mode != mode || runtime->text != text || runtime->font != font) {
+        runtime->mode != mode || runtime->text != text || runtime->font != font ||
+        runtime->text_size != text_size) {
         std::vector<PIXEL_RGBA> pixels(static_cast<std::size_t>(width) * height);
         video->get_image_data(pixels.data());
-        runtime->pieces = buildPieces(pixels, width, height, threshold, mode, text);
+        runtime->pieces = buildPieces(pixels, width, height, threshold, mode, text, text_size);
         const std::wstring built = std::wstring(L"[TextPhysicsFilter] pieces mode=") +
             std::to_wstring(mode) + L" text_length=" + std::to_wstring(text.size()) +
+            L" text_size=" + std::to_wstring(text_size) +
             L" pieces=" + std::to_wstring(runtime->pieces.size()) + L"\n";
         OutputDebugStringW(built.c_str());
         runtime->pieces_valid = true;
@@ -1112,6 +1151,7 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
         runtime->mode = mode;
         runtime->text = text;
         runtime->font = font;
+        runtime->text_size = text_size;
         runtime->destroyWorld();
     }
     const ObjectParams own = ownParams();

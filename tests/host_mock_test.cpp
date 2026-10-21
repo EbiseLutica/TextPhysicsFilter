@@ -228,6 +228,33 @@ int main() {
         check("text split: color tags are not counted", pieces(L"<#ff0000,000000>お<#>け") == 2,
               static_cast<float>(pieces(L"<#ff0000,000000>お<#>け")), 2.0f);
     }
+    // <sN> changes a character's size and <s> goes back to the object's size setting; widths
+    // and line heights follow. "<s60>あ<s>いう" at size 30: あ (two blobs) is twice as wide.
+    {
+        std::vector<PIXEL_RGBA> px(130 * 100, PIXEL_RGBA{0, 0, 0, 0});
+        auto fill = [&](int x0, int x1) {
+            for (int y = 10; y < 90; ++y) for (int x = x0; x < x1; ++x) px[y * 130 + x] = {255, 255, 255, 255};
+        };
+        fill(0, 25); fill(35, 60); fill(65, 85); fill(95, 115);
+        auto widest = [&](double default_size) {
+            int w = 0;
+            for (const auto& piece : buildPieces(px, 130, 100, 1, 0, L"<s60>あ<s>いう", default_size)) w = std::max(w, piece.width);
+            return w;
+        };
+        check("size tags: あ keeps its two blobs together", widest(30.0) == 60,
+              static_cast<float>(widest(30.0)), 60.0f);
+        check("size tags: ignored when the object size is unknown", widest(0.0) != 60,
+              static_cast<float>(widest(0.0)), 60.0f);
+
+        std::vector<PIXEL_RGBA> lines(60 * 170, PIXEL_RGBA{0, 0, 0, 0});
+        auto block = [&](int y0, int y1, int x1) {
+            for (int y = y0; y < y1; ++y) for (int x = 0; x < x1; ++x) lines[y * 60 + x] = {255, 255, 255, 255};
+        };
+        block(0, 80, 60); block(95, 125, 30); block(135, 160, 30);
+        const auto tall = buildPieces(lines, 60, 170, 1, 0, L"<s90>あ<s>\nい\nう", 30.0);
+        check("size tags: a tall first line gets a taller share", tall.size() == 3,
+              static_cast<float>(tall.size()), 3.0f);
+    }
     std::printf(failures ? "FAILED\n" : "ALL PASSED\n");
     return failures ? 1 : 0;
 }
