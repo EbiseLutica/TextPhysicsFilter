@@ -13,7 +13,7 @@ int MultiByteToWideChar(unsigned, unsigned long, const char* s, int n, wchar_t* 
     if (out && outn > 0) { for (size_t i = 0; i < w.size() && (int)i < outn; ++i) out[i] = w[i]; out[w.size()] = 0; }
     return (int)w.size() + 1;
 }
-void OutputDebugStringW(const wchar_t* m) { std::wprintf(L"%ls", m); }
+void OutputDebugStringW(const wchar_t*) {}
 
 struct MockObject {
     int layer, frame_s, frame_e, w, h;
@@ -186,6 +186,31 @@ int main() {
         for (g_frame = 151; g_frame <= 300; ++g_frame) { ya = render(a); yb = render(b); }
         check("edit: B leaves the group and falls to the floor", std::abs(ya - 490) < 3 && std::abs(yb - 490) < 3, ya, yb);
         cleanup();
+    }
+    // "1文字ずつ": a shorter second line must be split by its own extent, and full-width and
+    // Latin characters must not be given the same width.
+    {
+        auto blocks = [](int w, int h, const std::vector<std::pair<int, int>>& at) {
+            std::vector<PIXEL_RGBA> px(static_cast<std::size_t>(w) * h, PIXEL_RGBA{0, 0, 0, 0});
+            for (const auto& [x0, y0] : at)
+                for (int y = y0; y < y0 + 80; ++y)
+                    for (int x = x0; x < x0 + 90; ++x) px[static_cast<std::size_t>(y) * w + x] = {255, 255, 255, 255};
+            return px;
+        };
+        const auto lines = buildPieces(blocks(400, 200, {{0, 0}, {100, 0}, {200, 0}, {300, 0}, {0, 100}, {100, 100}}),
+                                       400, 200, 1, 0, L"あいうえ\nおか");
+        check("text split: short second line keeps its own characters", lines.size() == 6,
+              static_cast<float>(lines.size()), 6.0f);
+        // "iiiき": three narrow Latin letters then one full-width kana. Splitting the ink
+        // into four equal cells would put the first two letters in the same cell.
+        std::vector<PIXEL_RGBA> px(200 * 100, PIXEL_RGBA{0, 0, 0, 0});
+        auto fill = [&](int x0, int x1) {
+            for (int y = 10; y < 90; ++y) for (int x = x0; x < x1; ++x) px[y * 200 + x] = {255, 255, 255, 255};
+        };
+        fill(0, 20); fill(30, 50); fill(60, 80); fill(90, 190);
+        const auto mixed = buildPieces(px, 200, 100, 1, 0, L"iiiき");
+        check("text split: Latin letters are narrower than kana", mixed.size() == 4,
+              static_cast<float>(mixed.size()), 4.0f);
     }
     std::printf(failures ? "FAILED\n" : "ALL PASSED\n");
     return failures ? 1 : 0;

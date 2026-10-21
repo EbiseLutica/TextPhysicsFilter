@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -428,20 +429,71 @@ ObjectParams readParams(EDIT_SECTION* edit, OBJECT_HANDLE object, const ObjectPa
     return p;
 }
 
-std::vector<int> lineLengths(const std::wstring& text) {
-    std::vector<int> lengths(1, 0);
+// Rough advance width of a character relative to the font size. Full-width
+// characters are 1.0; Latin text is narrower and varies from letter to letter.
+double advanceWeight(wchar_t c) {
+    if (c == L' ') return 0.3;
+    if (c == 0x3000) return 1.0;
+    if (c >= 0xff61 && c <= 0xff9f) return 0.5;
+    if (c >= 0x1100 && (c <= 0x115f || (c >= 0x2e80 && c <= 0xa4cf) ||
+        (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
+        (c >= 0xfe30 && c <= 0xfe6f) || (c >= 0xff00 && c <= 0xff60) ||
+        (c >= 0xffe0 && c <= 0xffe6) || (c >= 0xd800 && c <= 0xdfff))) return 1.0;
+    if (std::wcschr(L"iljI.,:;!|'`", c)) return 0.3;
+    if (std::wcschr(L"frt()[]{}-/\\", c)) return 0.4;
+    if (std::wcschr(L"mwMW@%", c)) return 0.85;
+    if (c < 0x80) return 0.55;
+    return 1.0;
+}
+
+// Expected horizontal layout of one line of text, used to tell which character
+// each piece of ink belongs to.
+struct LineLayout {
+    std::vector<double> weights;
+    int first = 0;
+    int last = -1;
+    double total = 0.0;
+
+    // Index of the character at x, given the ink extent [left, right] of the line.
+    int column(double x, double left, double right) const {
+        if (weights.empty()) return 0;
+        if (last < first || right <= left) return std::max(first, 0);
+        const double position = std::clamp((x - left) / (right - left), 0.0, 1.0) * total;
+        double cumulative = 0.0;
+        for (int i = first; i <= last; ++i) {
+            cumulative += weights[i];
+            if (position < cumulative) return i;
+        }
+        return last;
+    }
+};
+
+std::vector<LineLayout> lineLayouts(const std::wstring& text) {
+    std::vector<LineLayout> layouts(1);
+    std::vector<std::vector<bool>> blanks(1);
     for (std::size_t i = 0; i < text.size(); ++i) {
         const wchar_t character = text[i];
         if (character == L'\r') continue;
         if (character == L'\n') {
-            lengths.push_back(0);
+            layouts.emplace_back();
+            blanks.emplace_back();
             continue;
         }
         if (character >= 0xd800 && character <= 0xdbff && i + 1 < text.size() &&
             text[i + 1] >= 0xdc00 && text[i + 1] <= 0xdfff) ++i;
-        ++lengths.back();
+        layouts.back().weights.push_back(advanceWeight(character));
+        blanks.back().push_back(character == L' ' || character == 0x3000 || character == L'\t');
     }
-    return lengths;
+    for (std::size_t line = 0; line < layouts.size(); ++line) {
+        auto& layout = layouts[line];
+        const int count = static_cast<int>(layout.weights.size());
+        layout.first = 0;
+        layout.last = count - 1;
+        while (layout.first < count && blanks[line][layout.first]) ++layout.first;
+        while (layout.last >= layout.first && blanks[line][layout.last]) --layout.last;
+        for (int i = layout.first; i <= layout.last; ++i) layout.total += layout.weights[i];
+    }
+    return layouts;
 }
 
 std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
@@ -459,7 +511,9 @@ std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
             groups[i].push_back(static_cast<int>(i));
         }
     } else {
-        const auto lengths = lineLengths(text);
+        const auto layouts = lineLayouts(text);
+        std::vector<int> lengths;
+        for (const auto& layout : layouts) lengths.push_back(static_cast<int>(layout.weights.size()));
         int left = width, top = height, right = -1, bottom = -1;
         for (const auto& component : components) {
             left = std::min(left, component.min_x);
@@ -474,11 +528,12 @@ std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
             group_count += std::max(0, lengths[line]);
         }
         groups.resize(std::max(1, group_count));
-        const double occupied_width = std::max(1, right - left + 1);
         const double occupied_height = std::max(1, bottom - top + 1);
+        std::vector<int> line_of(components.size(), 0);
+        std::vector<double> line_left(lengths.size(), static_cast<double>(width));
+        std::vector<double> line_right(lengths.size(), -1.0);
         for (std::size_t i = 0; i < components.size(); ++i) {
             const auto& component = components[i];
-            const double center_x = (component.min_x + component.max_x + 1) * 0.5;
             const double center_y = (component.min_y + component.max_y + 1) * 0.5;
             int line = std::clamp(static_cast<int>((center_y - top) *
                                   lengths.size() / occupied_height),
@@ -488,9 +543,17 @@ std::vector<Piece> buildPieces(const std::vector<PIXEL_RGBA>& pixels,
                 line = static_cast<int>(lengths.size()) - 1;
                 while (line > 0 && lengths[line] == 0) --line;
             }
-            const int characters = std::max(1, lengths[line]);
-            const int column = std::clamp(static_cast<int>((center_x - left) *
-                                          characters / occupied_width), 0, characters - 1);
+            line_of[i] = line;
+            line_left[line] = std::min(line_left[line], static_cast<double>(component.min_x));
+            line_right[line] = std::max(line_right[line], static_cast<double>(component.max_x + 1));
+        }
+        // Each line is split by its own ink extent, so lines of different length
+        // or alignment do not disturb each other.
+        for (std::size_t i = 0; i < components.size(); ++i) {
+            const auto& component = components[i];
+            const int line = line_of[i];
+            const double center_x = (component.min_x + component.max_x + 1) * 0.5;
+            const int column = layouts[line].column(center_x, line_left[line], line_right[line]);
             groups[std::clamp(offsets[line] + column, 0,
                               static_cast<int>(groups.size()) - 1)].push_back(
                                   static_cast<int>(i));
@@ -1011,6 +1074,10 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
         std::vector<PIXEL_RGBA> pixels(static_cast<std::size_t>(width) * height);
         video->get_image_data(pixels.data());
         runtime->pieces = buildPieces(pixels, width, height, threshold, mode, text);
+        const std::wstring built = std::wstring(L"[TextPhysicsFilter] pieces mode=") +
+            std::to_wstring(mode) + L" text_length=" + std::to_wstring(text.size()) +
+            L" pieces=" + std::to_wstring(runtime->pieces.size()) + L"\n";
+        OutputDebugStringW(built.c_str());
         runtime->pieces_valid = true;
         runtime->image_width = width;
         runtime->image_height = height;
