@@ -26,5 +26,10 @@ FetchContent_MakeAvailable(box2d)
 add_library(TextPhysicsFilter MODULE TextPhysicsFilter.cpp AlphaComponentSegmentation.h)
 target_include_directories(TextPhysicsFilter PRIVATE "${AVIUTL2_SDK_DIR}")
 target_link_libraries(TextPhysicsFilter PRIVATE box2d)
+# The sources are UTF-8 without BOM; without this MSVC reads them in the system
+# code page and the plugin name (and every label) turns into mojibake.
+if(MSVC)
+    target_compile_options(TextPhysicsFilter PRIVATE /utf-8)
+endif()
 # AviUtl2 loads filter plugins named *.auf2, which are plain DLLs.
 set_target_properties(TextPhysicsFilter PROPERTIES PREFIX "" SUFFIX ".auf2")
