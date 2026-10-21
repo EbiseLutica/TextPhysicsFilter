@@ -212,6 +212,22 @@ int main() {
         check("text split: Latin letters are narrower than kana", mixed.size() == 4,
               static_cast<float>(mixed.size()), 4.0f);
     }
+    // Control tags such as <s60> are not drawn, so they must not count as characters.
+    // The ink is "お" (one blob) followed by "け" (two blobs, like a stem and the rest).
+    {
+        std::vector<PIXEL_RGBA> px(200 * 100, PIXEL_RGBA{0, 0, 0, 0});
+        auto fill = [&](int x0, int x1) {
+            for (int y = 10; y < 90; ++y) for (int x = x0; x < x1; ++x) px[y * 200 + x] = {255, 255, 255, 255};
+        };
+        fill(0, 80); fill(100, 120); fill(130, 200);
+        auto pieces = [&](const wchar_t* text) { return buildPieces(px, 200, 100, 1, 0, text).size(); };
+        check("text split: plain text keeps け together", pieces(L"おけ") == 2,
+              static_cast<float>(pieces(L"おけ")), 2.0f);
+        check("text split: <s60> is not counted as characters", pieces(L"<s60>おけ") == 2,
+              static_cast<float>(pieces(L"<s60>おけ")), 2.0f);
+        check("text split: color tags are not counted", pieces(L"<#ff0000,000000>お<#>け") == 2,
+              static_cast<float>(pieces(L"<#ff0000,000000>お<#>け")), 2.0f);
+    }
     std::printf(failures ? "FAILED\n" : "ALL PASSED\n");
     return failures ? 1 : 0;
 }

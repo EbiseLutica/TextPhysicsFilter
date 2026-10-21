@@ -468,7 +468,34 @@ struct LineLayout {
     }
 };
 
-std::vector<LineLayout> lineLayouts(const std::wstring& text) {
+// Removes AviUtl2 text control tags such as <s60>, <#ff0000>, <#>, <p+10,0>, <w1>, <c>.
+// They are not drawn, so they must not count as characters.
+std::wstring stripControlTags(const std::wstring& text) {
+    std::wstring result;
+    result.reserve(text.size());
+    for (std::size_t i = 0; i < text.size();) {
+        if (text[i] == L'<') {
+            std::size_t end = i + 1;
+            while (end < text.size() && text[end] != L'>' && text[end] != L'<' &&
+                   text[end] != L'\n') ++end;
+            if (end < text.size() && text[end] == L'>' && end > i + 1 &&
+                std::wcschr(L"sprcw#?/", text[i + 1])) {
+                const bool clears_line = text[i + 1] == L'c';
+                i = end + 1;
+                if (clears_line) {
+                    if (i < text.size() && text[i] == L'\r') ++i;
+                    if (i < text.size() && text[i] == L'\n') ++i;
+                }
+                continue;
+            }
+        }
+        result.push_back(text[i++]);
+    }
+    return result;
+}
+
+std::vector<LineLayout> lineLayouts(const std::wstring& raw_text) {
+    const std::wstring text = stripControlTags(raw_text);
     std::vector<LineLayout> layouts(1);
     std::vector<std::vector<bool>> blanks(1);
     for (std::size_t i = 0; i < text.size(); ++i) {
