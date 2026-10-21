@@ -18,8 +18,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -700,16 +703,114 @@ void logNeighbor(const wchar_t* kind, int layer, std::size_t pieces) {
     OutputDebugStringW(message.c_str());
 }
 
-// Scans the other layers for text objects carrying this filter: static ones become
-// terrain, and (when this object has a collision group) non-static ones of the same
-// group become members of the world. Pixels are read back only when an object's
-// alias, pose or timing changes.
-void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, const ObjectParams& own,
-                      int group, int now_frame, int threshold) {
+// Metadata about a text object that carries this filter, found by scanning layers.
+struct ScanItem {
+    int layer;
+    OBJECT_HANDLE handle;
+    int frame_start;
+    int frame_end;
+    std::uint64_t alias_hash;
+};
+
+// Settings of such an object. Re-read only when its alias data changes.
+struct ObjectInfo {
+    bool is_static = false;
+    int group = 0;
+    int threshold = 1;
+    int mode = 0;
+    ObjectParams params;
+    OBJECT_IMAGE_PARAM start{};
+    std::wstring text;
+};
+
+struct ObjectKey {
+    int layer;
+    int frame_start;
+    int frame_end;
+    std::uint64_t alias_hash;
+    bool operator<(const ObjectKey& other) const {
+        return std::tie(layer, frame_start, frame_end, alias_hash) <
+               std::tie(other.layer, other.frame_start, other.frame_end, other.alias_hash);
+    }
+};
+
+// Shared by every instance in the process. All instances of one render pass see
+// the same scene, so the layer scan is done once per pass instead of once each.
+std::mutex shared_mutex;
+struct SharedScan {
+    std::int64_t rendering_id = 0;
+    int scene_id = -1;
+    int frame = -1;
+    std::vector<ScanItem> items;
+} shared_scan;
+std::map<ObjectKey, std::shared_ptr<const ObjectInfo>> object_infos;
+
+std::vector<ScanItem> scanObjects(FILTER_PROC_VIDEO* video, int now_frame) {
+    const std::int64_t pass = video->scene->rendering_id;
+    if (pass != 0) {
+        std::lock_guard<std::mutex> lock(shared_mutex);
+        if (shared_scan.rendering_id == pass && shared_scan.scene_id == video->scene->id &&
+            shared_scan.frame == now_frame) return shared_scan.items;
+    }
+    std::vector<ScanItem> items;
+    EDIT_SECTION* edit = video->edit;
+    if (edit && video->get_image_object && edit->get_object_item_value &&
+        edit->count_object_effect && edit->get_object_layer_frame) {
+        const int layer_max = edit->info
+            ? std::clamp(edit->info->layer_max, 0, kMaximumTerrainLayers - 1)
+            : kMaximumTerrainLayers - 1;
+        for (int layer = 0; layer <= layer_max; ++layer) {
+            const OBJECT_HANDLE object = video->get_image_object(layer, 0.0);
+            if (!object || edit->count_object_effect(object, kFilterName) <= 0) continue;
+            const OBJECT_LAYER_FRAME range = edit->get_object_layer_frame(object);
+            items.push_back({layer, object, range.start, range.end, hashAlias(edit, object)});
+        }
+    }
+    if (pass != 0) {
+        std::lock_guard<std::mutex> lock(shared_mutex);
+        shared_scan = {pass, video->scene->id, now_frame, items};
+    }
+    return items;
+}
+
+std::shared_ptr<const ObjectInfo> getObjectInfo(FILTER_PROC_VIDEO* video, const ScanItem& item,
+                                                int now_frame) {
+    const ObjectKey key{item.layer, item.frame_start, item.frame_end, item.alias_hash};
+    {
+        std::lock_guard<std::mutex> lock(shared_mutex);
+        const auto found = object_infos.find(key);
+        if (found != object_infos.end()) return found->second;
+    }
+    EDIT_SECTION* edit = video->edit;
+    auto info = std::make_shared<ObjectInfo>();
+    info->is_static = readBoolItem(edit, item.handle, kStaticItemName, false);
+    info->group = static_cast<int>(std::lround(
+        readNumberItem(edit, item.handle, collision_group.name, 0.0)));
+    info->threshold = std::clamp(static_cast<int>(std::lround(
+        readNumberItem(edit, item.handle, alpha_threshold.name, 1.0))), 1, 255);
+    info->mode = readSplitMode(edit, item.handle, 0);
+    info->params = readParams(edit, item.handle, ObjectParams{});
+    info->text = readTextItemOf(edit, item.handle, L"テキスト");
+    info->start.sx = info->start.sy = info->start.sz = 1.0f;
+    info->start.alpha = 1.0f;
+    const double offset = (item.frame_start - now_frame) *
+        (static_cast<double>(video->scene->scale) / video->scene->rate);
+    if (video->get_output_image_param &&
+        !video->get_output_image_param(item.handle, offset, &info->start, sizeof(info->start))) {
+        video->get_output_image_param(item.handle, 0.0, &info->start, sizeof(info->start));
+    }
+    std::lock_guard<std::mutex> lock(shared_mutex);
+    if (object_infos.size() > 512) object_infos.clear();
+    object_infos[key] = info;
+    return info;
+}
+
+// Sorts the other text objects into terrain (static ones) and, when this object has
+// a collision group, members of the world. Pixels are read back only when an
+// object's alias data changes.
+void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, int group, int now_frame) {
     std::vector<TerrainSource> terrains;
     std::vector<Neighbor> members;
-    EDIT_SECTION* edit = video->edit;
-    const double frame_seconds = static_cast<double>(video->scene->scale) / video->scene->rate;
     const auto fetchPieces = [&](int layer, int piece_threshold, int piece_mode,
                                  const std::wstring& text) {
         std::vector<Piece> pieces;
@@ -724,85 +825,52 @@ void refreshNeighbors(Runtime& runtime, FILTER_PROC_VIDEO* video, const ObjectPa
         }
         return pieces;
     };
-    if (edit && video->get_image_object && edit->get_object_item_value &&
-        edit->count_object_effect && edit->get_object_layer_frame) {
-        const int layer_max = edit->info
-            ? std::clamp(edit->info->layer_max, 0, kMaximumTerrainLayers - 1)
-            : kMaximumTerrainLayers - 1;
-        for (int layer = 0; layer <= layer_max; ++layer) {
-            if (layer == video->object->layer) continue;
-            const OBJECT_HANDLE object = video->get_image_object(layer, 0.0);
-            if (!object || object == video->object->handle ||
-                edit->count_object_effect(object, kFilterName) <= 0) continue;
-
-            if (readBoolItem(edit, object, kStaticItemName, false)) {
-                TerrainSource terrain;
-                terrain.layer = layer;
-                terrain.pose.sx = terrain.pose.sy = terrain.pose.sz = 1.0f;
-                terrain.pose.alpha = 1.0f;
-                if (!video->get_output_image_param ||
-                    (!video->get_output_image_param(object, -video->object->time,
-                                                    &terrain.pose, sizeof(terrain.pose)) &&
-                     !video->get_output_image_param(object, 0.0, &terrain.pose,
-                                                    sizeof(terrain.pose)))) continue;
-                std::uint64_t signature = hashAlias(edit, object);
-                hashValue(signature, terrain.pose);
-                hashValue(signature, threshold);
-                terrain.signature = signature;
-                const auto cached = std::find_if(runtime.terrains.begin(), runtime.terrains.end(),
-                    [&](const TerrainSource& old) {
-                        return old.layer == layer && old.signature == signature;
-                    });
-                if (cached != runtime.terrains.end()) {
-                    terrain.pieces = std::move(cached->pieces);
-                } else {
-                    terrain.pieces = fetchPieces(layer, threshold, 1, {});
-                    logNeighbor(L"terrain", layer, terrain.pieces.size());
-                }
-                terrains.push_back(std::move(terrain));
-                continue;
-            }
-
-            if (group <= 0 || std::lround(readNumberItem(
-                    edit, object, collision_group.name, 0.0)) != group) continue;
-            Neighbor member;
-            member.layer = layer;
-            const OBJECT_LAYER_FRAME range = edit->get_object_layer_frame(object);
-            member.frame_start = range.start;
-            member.frame_end = range.end;
-            member.start.sx = member.start.sy = member.start.sz = 1.0f;
-            member.start.alpha = 1.0f;
-            const double offset = (range.start - now_frame) * frame_seconds;
-            if (!video->get_output_image_param ||
-                (!video->get_output_image_param(object, offset, &member.start,
-                                                sizeof(member.start)) &&
-                 !video->get_output_image_param(object, 0.0, &member.start,
-                                                sizeof(member.start)))) continue;
-            member.params = readParams(edit, object, own);
-            const int member_threshold = std::clamp(static_cast<int>(std::lround(
-                readNumberItem(edit, object, alpha_threshold.name, threshold))), 1, 255);
-            const int member_mode = readSplitMode(edit, object, 0);
-            std::uint64_t signature = hashAlias(edit, object);
-            hashValue(signature, member.start);
-            hashValue(signature, layer);
-            hashValue(signature, range.start);
-            hashValue(signature, range.end);
-            hashValue(signature, member_threshold);
-            hashValue(signature, member_mode);
-            member.signature = signature;
-            const auto cached = std::find_if(runtime.members.begin(), runtime.members.end(),
-                [&](const Neighbor& old) {
-                    return old.layer == layer && old.signature == signature;
+    for (const auto& item : scanObjects(video, now_frame)) {
+        if (item.layer == video->object->layer || item.handle == video->object->handle) continue;
+        const auto info = getObjectInfo(video, item, now_frame);
+        if (!info->is_static && (group <= 0 || info->group != group)) continue;
+        std::uint64_t signature = item.alias_hash;
+        hashValue(signature, item.layer);
+        hashValue(signature, item.frame_start);
+        hashValue(signature, item.frame_end);
+        hashValue(signature, info->threshold);
+        hashValue(signature, info->mode);
+        if (info->is_static) {
+            TerrainSource terrain;
+            terrain.layer = item.layer;
+            terrain.signature = signature;
+            terrain.pose = info->start;
+            const auto cached = std::find_if(runtime.terrains.begin(), runtime.terrains.end(),
+                [&](const TerrainSource& old) {
+                    return old.layer == item.layer && old.signature == signature;
                 });
-            if (cached != runtime.members.end()) {
-                member.pieces = std::move(cached->pieces);
+            if (cached != runtime.terrains.end()) {
+                terrain.pieces = std::move(cached->pieces);
             } else {
-                member.pieces = fetchPieces(layer, member_threshold, member_mode,
-                                            readTextItemOf(edit, object, L"テキスト"));
-                logNeighbor(L"member", layer, member.pieces.size());
+                terrain.pieces = fetchPieces(item.layer, info->threshold, 1, {});
+                logNeighbor(L"terrain", item.layer, terrain.pieces.size());
             }
-            members.push_back(std::move(member));
+            terrains.push_back(std::move(terrain));
+            continue;
         }
+        Neighbor member;
+        member.layer = item.layer;
+        member.frame_start = item.frame_start;
+        member.frame_end = item.frame_end;
+        member.signature = signature;
+        member.start = info->start;
+        member.params = info->params;
+        const auto cached = std::find_if(runtime.members.begin(), runtime.members.end(),
+            [&](const Neighbor& old) {
+                return old.layer == item.layer && old.signature == signature;
+            });
+        if (cached != runtime.members.end()) {
+            member.pieces = std::move(cached->pieces);
+        } else {
+            member.pieces = fetchPieces(item.layer, info->threshold, info->mode, info->text);
+            logNeighbor(L"member", item.layer, member.pieces.size());
+        }
+        members.push_back(std::move(member));
     }
     runtime.terrains = std::move(terrains);
     runtime.members = std::move(members);
@@ -977,7 +1045,7 @@ bool processVideo(FILTER_PROC_VIDEO* video) {
     const int group = std::clamp(static_cast<int>(std::lround(collision_group.value)), 0, 99);
     const int frame = std::max(0, video->object->frame);
     const int now_frame = video->object->frame_s + frame;
-    refreshNeighbors(*runtime, video, own, group, now_frame, threshold);
+    refreshNeighbors(*runtime, video, group, now_frame);
 
     std::vector<SimEntry> entries;
     entries.push_back({video->object->layer, video->object->frame_s, video->object->frame_e,

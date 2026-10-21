@@ -26,6 +26,7 @@ struct MockObject {
 static std::vector<MockObject*> g_objects;
 static MockObject* g_current = nullptr;
 static int g_frame = 0;
+static int g_pass = 0, g_last_frame = -1;
 static std::map<std::wstring, std::pair<std::vector<PIXEL_RGBA>, std::pair<int, int>>> g_resources;
 static std::vector<std::pair<float, float>> g_draws;
 static std::string g_string_buffer;
@@ -55,6 +56,7 @@ static FILTER_PROC_VIDEO makeVideo(MockObject* o) {
     g_object_info.effect_id = 100 + o->layer; g_object_info.layer = o->layer;
     g_object_info.frame_s = o->frame_s; g_object_info.frame_e = o->frame_e;
     g_object_info.handle = o;
+    g_scene.rendering_id = g_pass;
     v.scene = &g_scene; v.object = &g_object_info; v.userdata = o->runtime; v.edit = &g_edit;
     v.get_image_data = [](PIXEL_RGBA* b) { std::copy(g_current->image.begin(), g_current->image.end(), b); };
     v.create_image_resource = [](LPCWSTR, const PIXEL_RGBA*, int, int) {};
@@ -86,7 +88,8 @@ static void setupEdit() {
     g_edit.get_object_layer_frame = [](OBJECT_HANDLE h) {
         auto* o = (MockObject*)h; return OBJECT_LAYER_FRAME{o->layer, o->frame_s, o->frame_e}; };
     g_edit.get_object_alias = [](OBJECT_HANDLE h) -> LPCSTR {
-        static std::string a; a = "alias" + std::to_string(((MockObject*)h)->layer); return a.c_str(); };
+        static std::string a; auto* o = (MockObject*)h; a = "alias" + std::to_string(o->layer);
+        for (auto& kv : o->items) a += "," + std::string(kv.second); return a.c_str(); };
     g_edit.get_object_item_value = [](OBJECT_HANDLE h, LPCWSTR, LPCWSTR item) -> LPCSTR {
         auto* o = (MockObject*)h; auto it = o->items.find(item);
         if (it == o->items.end()) return nullptr; g_string_buffer = it->second; return g_string_buffer.c_str(); };
@@ -104,6 +107,7 @@ static MockObject* makeBox(int layer, float x, float y, int group, bool is_stati
 
 // Renders one object at g_frame the way the host would and returns its world y (centre).
 static float render(MockObject* o) {
+    if (g_frame != g_last_frame) { ++g_pass; g_last_frame = g_frame; }
     g_draws.clear();
     FILTER_PROC_VIDEO v = makeVideo(o);
     static_object.value = o->items[static_object.name] == "1";
@@ -114,6 +118,7 @@ static float render(MockObject* o) {
 }
 
 static void cleanup() {
+    shared_scan = {}; object_infos.clear(); g_last_frame = -1;
     for (auto* o : g_objects) { destroyRuntime(0, o->runtime); delete o; }
     g_objects.clear();
 }
@@ -167,6 +172,19 @@ int main() {
         float yb = 0;
         for (g_frame = 0; g_frame <= 300; ++g_frame) { render(a); yb = render(b); }
         check("static terrain: B rests on static A", std::abs(yb - 300) < 3, yb, 300.0f);
+        cleanup();
+    }
+    // Editing an object's settings (its alias changes) is picked up on the next render pass.
+    {
+        MockObject* a = makeBox(0, 0, 400, 1, false);
+        MockObject* b = makeBox(1, 0, 0, 1, false);
+        float ya = 0, yb = 0;
+        for (g_frame = 0; g_frame <= 150; ++g_frame) { ya = render(a); yb = render(b); }
+        check("edit: B rests on A before the edit", std::abs(yb - 390) < 3, ya, yb);
+        b->items[collision_group.name] = "0";
+        ++g_pass; ya = render(a); yb = render(b);
+        for (g_frame = 151; g_frame <= 300; ++g_frame) { ya = render(a); yb = render(b); }
+        check("edit: B leaves the group and falls to the floor", std::abs(ya - 490) < 3 && std::abs(yb - 490) < 3, ya, yb);
         cleanup();
     }
     std::printf(failures ? "FAILED\n" : "ALL PASSED\n");
