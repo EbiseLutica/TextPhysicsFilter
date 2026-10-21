@@ -13,6 +13,8 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +43,21 @@ jobs:
           name: TextPhysicsFilter-${{ github.sha }}
           path: build/Release/TextPhysicsFilter.auf2
           if-no-files-found: error
+
+      # Rolling pre-release per branch so the latest build has a fixed download URL:
+      #   https://github.com/<owner>/<repo>/releases/download/dev-<branch>/TextPhysicsFilter.auf2
+      - name: Publish dev release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="dev-${GITHUB_REF_NAME//\//-}"
+          gh release delete "$tag" --cleanup-tag --yes || true
+          gh release create "$tag" build/Release/TextPhysicsFilter.auf2 \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "dev build ($GITHUB_REF_NAME)" \
+            --notes "Automated build of $GITHUB_SHA"
 
   host-test:
     runs-on: ubuntu-latest
